@@ -45,12 +45,12 @@ If endpoint agents are involved:
 
 Always structure your analysis as:
 
-### 🔍 Investigation Summary
+### Investigation Summary
 - **Trigger**: What alarm/event initiated this investigation
 - **Time Window**: When the issue was detected
 - **Scope**: Which tests, agents, and targets are affected
 
-### 📊 Evidence Gathered
+### Evidence Gathered
 For each data source queried, summarize key findings:
 - Events and their details
 - Alert thresholds violated
@@ -58,19 +58,19 @@ For each data source queried, summarize key findings:
 - Path analysis findings
 - BGP/routing observations
 
-### 🔗 Correlation Analysis
+### Correlation Analysis
 - Timeline of events (what happened first, what followed)
 - Common factors across affected tests/agents
 - What's healthy vs. what's degraded
 - Layer isolation (network, transport, application)
 
-### 🎯 Root Cause Assessment
+### Root Cause Assessment
 - **Most Likely Root Cause**: Clear statement of what's causing the issue
 - **Confidence Level**: High / Medium / Low
 - **Supporting Evidence**: Bullet points of evidence supporting this conclusion
 - **Alternative Hypotheses**: Other possible causes that couldn't be fully ruled out
 
-### 💡 Recommended Actions
+### Recommended Actions
 - Immediate mitigation steps
 - Longer-term fixes
 - Monitoring recommendations

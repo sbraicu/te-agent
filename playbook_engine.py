@@ -136,7 +136,7 @@ async def execute_playbook(
     vars_ = {**build_time_window(), **(variables or {})}
     findings = {}
 
-    console.print(f"\n[bold yellow]📋 {playbook_name}: {pb['description']}[/bold yellow]")
+    console.print(f"\n[bold yellow]PLAYBOOK {playbook_name}: {pb['description']}[/bold yellow]")
     console.print(f"[dim]{len(steps)} steps[/dim]\n")
 
     for i, step in enumerate(steps, 1):
@@ -148,13 +148,13 @@ async def execute_playbook(
         if condition and findings:
             should_run = await evaluate_condition(llm_client, model, condition, findings)
             if not should_run:
-                console.print(f"  [{i}/{len(steps)}] [dim]⏭ {step_id} (skipped: {condition})[/dim]")
+                console.print(f"  [{i}/{len(steps)}] [dim]SKIP {step_id} (skipped: {condition})[/dim]")
                 findings[step_id] = f"Skipped — condition not met: {condition}"
                 continue
 
         if tool == "none":
             prompt = step.get("prompt", "Summarize all findings.")
-            console.print(f"  [{i}/{len(steps)}] [bold magenta]🧠 {step_id}[/bold magenta]")
+            console.print(f"  [{i}/{len(steps)}] [bold magenta]THINK {step_id}[/bold magenta]")
             result = await synthesize(llm_client, model, findings, prompt)
             findings[step_id] = result
         else:
@@ -167,11 +167,11 @@ async def execute_playbook(
                 raw = result.content[0].text if result.content else "No data returned"
             except Exception as e:
                 raw = f"Tool call failed: {e}"
-                console.print(f"    [red]⚠ {raw[:100]}[/red]")
+                console.print(f"    [red]ERROR: {raw[:100]}[/red]")
 
             summary = await summarize_with_llm(llm_client, model, raw, extract_prompt)
             findings[step_id] = summary
-            console.print(f"    [green]✓[/green] {summary[:100]}...")
+            console.print(f"    [green]OK[/green] {summary[:100]}...")
 
     final = findings.get(steps[-1]["id"], "No result.")
     return final, findings
