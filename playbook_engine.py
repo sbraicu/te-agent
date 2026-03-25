@@ -65,7 +65,8 @@ async def summarize_with_llm(llm_client, model: str, raw_text: str, extract_prom
                 "content": (
                     "You are a data extraction assistant. Extract ONLY the requested "
                     "information from the raw API data. Be concise, factual, no speculation. "
-                    "If the data doesn't contain what's asked, say so."
+                    "If the data doesn't contain what's asked, say so. "
+                    "Do NOT use emoji or icons in your output."
                 ),
             },
             {
@@ -87,7 +88,7 @@ async def synthesize(llm_client, model: str, findings: dict, prompt: str) -> str
     resp = llm_client.chat.completions.create(
         model=model,
         messages=[
-            {"role": "system", "content": prompt},
+            {"role": "system", "content": prompt + "\n\nIMPORTANT: Do NOT use emoji or icons anywhere in your output."},
             {"role": "user", "content": f"## Investigation Findings\n\n{findings_text}"},
         ],
         temperature=0.2,
