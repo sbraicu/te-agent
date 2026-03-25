@@ -30,7 +30,7 @@ playbooks:
           List each account group: name, id, is_default. Max 10 lines.
 
       - id: all_tests
-        tool: list_tests
+        tool: list_network_app_synthetics_tests
         params: {}
         extract: |
           Produce a summary table of all tests grouped by type:
@@ -212,11 +212,12 @@ playbooks:
           State: agent type finding + blast radius + likely fault domain + whether path analysis is needed.
 
       - id: path_analysis
-        tool: get_path_visualization
+        tool: get_path_visualization_results
         condition: "The fault isolation concluded that path analysis IS needed (not a clear target-side application-layer issue)"
         params:
-          testId: "{{test_id}}"
-          window: "1h"
+          test_id: "{{test_id}}"
+          start_date: "{{window_start}}"
+          end_date: "{{window_end}}"
         extract: |
           For each agent path: total hops, any hops with loss > 0%,
           any hops with latency spikes, which AS/provider each problem hop belongs to.
@@ -226,8 +227,9 @@ playbooks:
         tool: get_anomalies
         condition: "The issue is NOT a clear total outage (0% availability across all agents for the entire window)"
         params:
-          testId: "{{test_id}}"
-          window: "24h"
+          test_ids: ["{{test_id}}"]
+          start_time_iso: "{{window_start}}"
+          end_time_iso: "{{window_end}}"
         extract: |
           List anomalies: metric, direction, magnitude, start_time.
           If none or error, say so. Max 5 lines.
@@ -267,10 +269,11 @@ playbooks:
           - Follow-up
 
       - id: validate
-        tool: run_instant_test
-        condition: "The issue is still active (alert state is TRIGGER) AND the root cause confidence is Medium or Low"
+        tool: run_http_server_instant_test
+        condition: "The issue is still active (alert state is TRIGGER) AND the root cause confidence is Medium or Low AND the target URL is known from test_config"
         params:
-          testId: "{{test_id}}"
+          url: "{{target_url}}"
+          agent_ids: ["{{agent_id}}"]
         extract: |
           Did the instant test confirm the issue? Compare result with the root cause assessment.
           State: CONFIRMED / NOT CONFIRMED / INCONCLUSIVE. Max 3 lines.
@@ -322,10 +325,11 @@ playbooks:
           State conclusion.
 
       - id: path_to_dns
-        tool: get_path_visualization
+        tool: get_path_visualization_results
         params:
-          testId: "{{test_id}}"
-          window: "1h"
+          test_id: "{{test_id}}"
+          start_date: "{{window_start}}"
+          end_date: "{{window_end}}"
         extract: |
           Network path to DNS server: any loss or latency to the DNS server itself? Max 5 lines.
 
@@ -442,8 +446,9 @@ playbooks:
       - id: full_path
         tool: get_full_path_visualization
         params:
-          testId: "{{test_id}}"
-          window: "1h"
+          test_id: "{{test_id}}"
+          start_date: "{{window_start}}"
+          end_date: "{{window_end}}"
         extract: |
           For EACH agent: trace the path hop by hop.
           Identify: last responding hop, first non-responding hop,
@@ -451,11 +456,12 @@ playbooks:
           Find the COMMON point where paths break across agents. Max 12 lines.
 
       - id: bgp_check
-        tool: get_bgp_test_results
+        tool: get_bgp_route_test_results
         condition: "The path visualization shows the break point is at a network/AS boundary, OR paths break at different points for different agents"
         params:
-          testId: "{{test_id}}"
-          window: "6h"
+          test_id: "{{test_id}}"
+          start_date: "{{window_start}}"
+          end_date: "{{window_end}}"
         extract: |
           BGP reachability: is the prefix reachable from all monitors?
           Any reachability drops? When? Correlate with loss timeline. Max 6 lines.
@@ -539,11 +545,12 @@ playbooks:
           Any packet loss? Loss causes TCP retransmissions which inflate latency. Max 3 lines.
 
       - id: path_analysis
-        tool: get_path_visualization
+        tool: get_path_visualization_results
         condition: "Network latency is elevated (not just TTFB/application slowness)"
         params:
-          testId: "{{test_id}}"
-          window: "1h"
+          test_id: "{{test_id}}"
+          start_date: "{{window_start}}"
+          end_date: "{{window_end}}"
         extract: |
           Identify the hop(s) contributing most latency.
           Which AS/provider? Is it a peering point, backbone, or last-mile? Max 8 lines.
@@ -551,8 +558,9 @@ playbooks:
       - id: anomalies
         tool: get_anomalies
         params:
-          testId: "{{test_id}}"
-          window: "24h"
+          test_ids: ["{{test_id}}"]
+          start_time_iso: "{{window_start}}"
+          end_time_iso: "{{window_end}}"
         extract: |
           Any latency or response time anomalies? When, magnitude. Max 4 lines.
 
@@ -583,29 +591,32 @@ playbooks:
     inputs: [test_id]
     steps:
       - id: bgp_results
-        tool: get_bgp_test_results
+        tool: get_bgp_route_test_results
         params:
-          testId: "{{test_id}}"
-          window: "6h"
+          test_id: "{{test_id}}"
+          start_date: "{{window_start}}"
+          end_date: "{{window_end}}"
         extract: |
           Prefix, reachability % over time, number of monitors,
           any reachability changes and when. Max 6 lines.
 
       - id: bgp_routes
-        tool: get_bgp_route_details
+        tool: get_bgp_route_test_results
         params:
-          testId: "{{test_id}}"
-          window: "6h"
+          test_id: "{{test_id}}"
+          start_date: "{{window_start}}"
+          end_date: "{{window_end}}"
         extract: |
           AS paths seen from different monitors. Any changes?
           New ASes appearing? Path lengthening? Multiple origin ASes?
           Signs of hijack (unexpected origin AS) or leak (unexpected transit AS)? Max 8 lines.
 
       - id: path_impact
-        tool: get_path_visualization
+        tool: get_path_visualization_results
         params:
-          testId: "{{test_id}}"
-          window: "1h"
+          test_id: "{{test_id}}"
+          start_date: "{{window_start}}"
+          end_date: "{{window_end}}"
         extract: |
           Data-plane paths: do they match BGP control-plane?
           Any traffic going through unexpected ASes? Max 6 lines.
@@ -691,7 +702,7 @@ playbooks:
     inputs: [test_ids]
     steps:
       - id: test_details
-        tool: list_tests
+        tool: list_network_app_synthetics_tests
         params: {}
         extract: |
           For each test in {{test_ids}}: test_name, target, type, agents.
