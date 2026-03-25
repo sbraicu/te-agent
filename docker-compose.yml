@@ -1,0 +1,8 @@
+services:
+  rca-agent:
+    build: .
+    env_file: .env
+    stdin_open: true
+    tty: true
+    # Single query mode — uncomment and set your query:
+    # command: ["python3", "agent.py", "-q", "Investigate all active events and determine root cause"]

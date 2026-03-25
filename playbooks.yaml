@@ -1,0 +1,732 @@
+# ============================================================================
+# ThousandEyes RCA Agent — Investigation Playbooks
+#
+# Generic playbooks that work on any ThousandEyes account.
+# The agent auto-discovers the environment first, then routes to the right
+# playbook based on what it finds.
+#
+# Structure:
+#   - Each playbook is a sequence of steps
+#   - Each step calls an MCP tool and has an "extract" prompt to compress
+#     the raw response into a few lines
+#   - Steps with tool: none are LLM synthesis steps
+#   - {{variables}} are filled at runtime by the router/engine
+#   - Steps with "condition" are evaluated against previous findings
+#     and skipped if the condition is not met (saves API calls)
+# ============================================================================
+
+playbooks:
+
+  # ──────────────────────────────────────────────
+  # DISCOVER: learn the environment (runs once per session)
+  # ──────────────────────────────────────────────
+  discover:
+    description: "Auto-discover the ThousandEyes environment — tests, agents, account groups"
+    steps:
+      - id: account_groups
+        tool: get_account_groups
+        params: {}
+        extract: |
+          List each account group: name, id, is_default. Max 10 lines.
+
+      - id: all_tests
+        tool: list_tests
+        params: {}
+        extract: |
+          Produce a summary table of all tests grouped by type:
+          - Count per type (http-server, page-load, dns-server, dns-trace,
+            network, agent-to-agent, bgp, web-transaction, sip, voice, ftp)
+          - For each test: test_id, test_name, target, enabled, interval
+          Max 30 lines. This is critical context for all future investigations.
+
+      - id: endpoint_agents
+        tool: list_endpoint_agents
+        params: {}
+        extract: |
+          Count of endpoint agents. List first 10: agent_id, name, location, OS, status.
+          If none, say "No endpoint agents deployed."
+
+      - id: environment_summary
+        tool: none
+        prompt: |
+          Produce an environment profile from the discovery data:
+          1. Account groups available
+          2. Test portfolio: how many of each type, what's being monitored
+          3. Whether endpoint agents exist
+          4. Key observations (e.g. "heavy on HTTP monitoring", "no BGP tests", etc.)
+          This profile will be used to guide all future investigations.
+
+  # ──────────────────────────────────────────────
+  # TRIAGE: what's happening right now
+  # ──────────────────────────────────────────────
+  triage:
+    description: "Triage all active events, alerts, and outages — classify and prioritize"
+    steps:
+      - id: events
+        tool: list_events
+        params:
+          window: "{{window}}"
+        extract: |
+          List each event: event_id | type | severity | state | start_time | affected_test | summary.
+          If none, say "No active events." Max 15 lines.
+
+      - id: alerts
+        tool: list_alerts
+        params:
+          state: "TRIGGER"
+        extract: |
+          List each alert: alert_id | severity | test_name | test_id | test_type |
+          rule_name | rule_expression | start_time | violation_count.
+          If none, say "No active alerts." Max 15 lines.
+
+      - id: outages
+        tool: search_outages
+        params:
+          window: "{{window}}"
+        extract: |
+          List each outage: outage_id | type (network/application) | provider/target |
+          start_time | end_time | affected_test_count.
+          If none, say "No outages." Max 10 lines.
+
+      - id: classify
+        tool: none
+        prompt: |
+          From the events, alerts, and outages found, produce:
+
+          ## Active Issues
+          For each issue, classify it:
+          - CATEGORY: one of [http_error, dns_failure, ssl_tls, connectivity_loss,
+            packet_loss, latency_degradation, bgp_anomaly, endpoint_issue, application_error]
+          - SEVERITY: critical / major / minor / info
+          - BLAST_RADIUS: single_agent / regional / global (all agents)
+          - TEST_TYPE: the type of test involved
+          - RECOMMENDED_PLAYBOOK: which playbook to run next
+          - VARIABLES: the alert_id, test_id, etc. needed for that playbook
+
+          ## Correlation
+          - Are multiple issues related? (same time, same target, same provider)
+          - Which issue is likely the root cause vs. a symptom?
+
+          ## Priority Order
+          List issues in order of investigation priority (most impactful first).
+
+  # ──────────────────────────────────────────────
+  # HTTP_ERROR: HTTP test returning errors
+  # ──────────────────────────────────────────────
+  http_error:
+    description: "Investigate HTTP errors — 4xx/5xx, timeouts, connection failures"
+    inputs: [alert_id, test_id]
+    steps:
+      - id: alert_details
+        tool: get_alert
+        params:
+          alert_id: "{{alert_id}}"
+        extract: |
+          Extract: severity, state, start_time, violation_count,
+          alert_rule (name + expression), error_type if present,
+          list of affected agents (name + location), affected targets.
+          Identify: is this an error-type alert or a threshold alert? Max 10 lines.
+
+      - id: test_config
+        tool: get_network_app_synthetics_test
+        params:
+          testId: "{{test_id}}"
+          type: "http-server"
+        extract: |
+          Extract: test_name, target URL, protocol (HTTP/HTTPS), port,
+          auth type, SSL verification enabled?, follow redirects?,
+          agents (name + location), interval, timeout. Max 8 lines.
+
+      - id: availability
+        tool: get_network_app_synthetics_metrics
+        params:
+          metric_id: "WEB_AVAILABILITY"
+          start_date: "{{window_start}}"
+          end_date: "{{window_end}}"
+          aggregation_type: "MEAN"
+          filter_dimension: "TEST"
+          filter_values: ["{{test_id}}"]
+        extract: |
+          Availability trend: current, min, max, average.
+          When did drops start? Is it 0% (total outage) or partial?
+          Which agents show 0% vs partial vs 100%? Max 5 lines.
+
+      - id: response_time
+        tool: get_network_app_synthetics_metrics
+        params:
+          metric_id: "WEB_TTFB"
+          start_date: "{{window_start}}"
+          end_date: "{{window_end}}"
+          aggregation_type: "MEAN"
+          filter_dimension: "TEST"
+          filter_values: ["{{test_id}}"]
+        extract: |
+          TTFB trend: current, min, max, average.
+          Any spikes? Correlation with availability drops? Max 4 lines.
+
+      - id: network_loss
+        tool: get_network_app_synthetics_metrics
+        params:
+          metric_id: "NET_LOSS"
+          start_date: "{{window_start}}"
+          end_date: "{{window_end}}"
+          aggregation_type: "MEAN"
+          filter_dimension: "TEST"
+          filter_values: ["{{test_id}}"]
+        extract: |
+          Packet loss: current, average, max. Any loss > 0%? When? Max 4 lines.
+
+      - id: network_latency
+        tool: get_network_app_synthetics_metrics
+        params:
+          metric_id: "NET_LATENCY"
+          start_date: "{{window_start}}"
+          end_date: "{{window_end}}"
+          aggregation_type: "MEAN"
+          filter_dimension: "TEST"
+          filter_values: ["{{test_id}}"]
+        extract: |
+          Latency: current, average, max. Any spikes? Max 4 lines.
+
+      - id: fault_isolation
+        tool: none
+        prompt: |
+          Based on the findings so far, determine the fault domain.
+
+          STEP 1 — AGENT TYPE ANALYSIS:
+          Look at which agents are affected from the alert details and test config.
+          - If ONLY endpoint agents affected → user network, WiFi, VPN, proxy, or device issue
+          - If ONLY cloud/enterprise agents affected → backend, DNS, CDN, internet routing, or upstream provider
+          - If ONLY enterprise agents affected → internal WAN, firewall, proxy, SD-WAN, or branch egress
+          - If BOTH endpoint AND cloud/enterprise affected → shared infrastructure or target-side issue
+
+          STEP 2 — BLAST RADIUS:
+          - ALL agents affected + low latency + low loss → TARGET-SIDE (server down, app error, auth failure, cert)
+          - ALL agents affected + high loss or timeout → target-side OR upstream provider
+          - SOME agents affected (same region) → REGIONAL or ISP-SPECIFIC
+          - SOME agents affected (same ISP) → ISP-SPECIFIC
+          - ONE agent affected → AGENT-SIDE (local network)
+          - Partial availability + high TTFB → APPLICATION PERFORMANCE (slow, not down)
+
+          STEP 3 — CONCLUSION:
+          State: agent type finding + blast radius + likely fault domain + whether path analysis is needed.
+
+      - id: path_analysis
+        tool: get_path_visualization
+        condition: "The fault isolation concluded that path analysis IS needed (not a clear target-side application-layer issue)"
+        params:
+          testId: "{{test_id}}"
+          window: "1h"
+        extract: |
+          For each agent path: total hops, any hops with loss > 0%,
+          any hops with latency spikes, which AS/provider each problem hop belongs to.
+          Where does the path break or degrade? Max 8 lines.
+
+      - id: anomalies
+        tool: get_anomalies
+        condition: "The issue is NOT a clear total outage (0% availability across all agents for the entire window)"
+        params:
+          testId: "{{test_id}}"
+          window: "24h"
+        extract: |
+          List anomalies: metric, direction, magnitude, start_time.
+          If none or error, say so. Max 5 lines.
+
+      - id: root_cause
+        tool: none
+        prompt: |
+          You are a network operations expert. Using ALL findings, determine root cause.
+
+          FIRST, write a one-line working diagnosis in this exact format:
+          DIAGNOSIS: [symptom] + [blast radius] + [likely fault domain] + [confidence]
+          Example: "DIAGNOSIS: 0% HTTP availability from all 8 global cloud agents, target-side application-layer auth failure, high confidence"
+
+          THEN provide the full analysis:
+
+          ## Investigation Summary
+          - Trigger: what alert started this
+          - Time Window: when it started
+          - Scope: which agents/locations affected vs healthy
+
+          ## Evidence
+          Summarize each data source's key finding in one line.
+
+          ## Fault Isolation
+          - Layer: Network (L3) / Transport (L4) / Application (L7) / DNS / SSL-TLS
+          - Location: Agent-side / Mid-path (which provider) / Target-side
+          - Scope: Single agent / Regional / Global
+
+          ## Root Cause
+          - Most Likely Cause: (clear statement)
+          - Confidence: High / Medium / Low
+          - Evidence: (bullet points)
+          - Alternatives: (if any)
+
+          ## Recommended Actions
+          - Immediate steps
+          - Follow-up
+
+      - id: validate
+        tool: run_instant_test
+        condition: "The issue is still active (alert state is TRIGGER) AND the root cause confidence is Medium or Low"
+        params:
+          testId: "{{test_id}}"
+        extract: |
+          Did the instant test confirm the issue? Compare result with the root cause assessment.
+          State: CONFIRMED / NOT CONFIRMED / INCONCLUSIVE. Max 3 lines.
+
+  # ──────────────────────────────────────────────
+  # DNS_FAILURE: DNS resolution issues
+  # ──────────────────────────────────────────────
+  dns_failure:
+    description: "Investigate DNS resolution failures or slowness"
+    inputs: [alert_id, test_id]
+    steps:
+      - id: alert_details
+        tool: get_alert
+        params:
+          alert_id: "{{alert_id}}"
+        extract: |
+          Extract: severity, state, start_time, violation_count,
+          error details, affected agents, affected targets/domains. Max 8 lines.
+
+      - id: test_config
+        tool: get_network_app_synthetics_test
+        params:
+          testId: "{{test_id}}"
+        extract: |
+          Extract: test_name, target domain, DNS server(s) configured,
+          record type, agents, interval. Max 6 lines.
+
+      - id: dns_metrics
+        tool: get_network_app_synthetics_metrics
+        params:
+          metric_id: "WEB_AVAILABILITY"
+          start_date: "{{window_start}}"
+          end_date: "{{window_end}}"
+          aggregation_type: "MEAN"
+          filter_dimension: "TEST"
+          filter_values: ["{{test_id}}"]
+        extract: |
+          Availability/resolution success rate over time.
+          When did failures start? Intermittent or sustained? Max 5 lines.
+
+      - id: fault_isolation
+        tool: none
+        prompt: |
+          Based on findings, determine:
+          - If ALL agents fail → DNS server issue or domain-level problem (NXDOMAIN, expired domain)
+          - If SOME agents fail → DNS server reachability issue from specific networks,
+            or split-horizon DNS returning different results
+          - If resolution succeeds but is slow → DNS server performance issue
+          State conclusion.
+
+      - id: path_to_dns
+        tool: get_path_visualization
+        params:
+          testId: "{{test_id}}"
+          window: "1h"
+        extract: |
+          Network path to DNS server: any loss or latency to the DNS server itself? Max 5 lines.
+
+      - id: root_cause
+        tool: none
+        prompt: |
+          FIRST, write a one-line working diagnosis:
+          DIAGNOSIS: [symptom] + [blast radius] + [likely fault domain] + [confidence]
+
+          THEN determine DNS failure root cause using the standard RCA format.
+          Consider: domain expiry, DNS server down, DNSSEC validation failure,
+          network path to DNS server blocked, DNS misconfiguration, propagation delay.
+
+  # ──────────────────────────────────────────────
+  # SSL_TLS: certificate and handshake issues
+  # ──────────────────────────────────────────────
+  ssl_tls:
+    description: "Investigate SSL/TLS certificate or handshake failures"
+    inputs: [alert_id, test_id]
+    steps:
+      - id: alert_details
+        tool: get_alert
+        params:
+          alert_id: "{{alert_id}}"
+        extract: |
+          Extract: severity, error type/message (look for SSL, certificate, TLS,
+          handshake keywords), affected agents, start_time. Max 8 lines.
+
+      - id: test_config
+        tool: get_network_app_synthetics_test
+        params:
+          testId: "{{test_id}}"
+          type: "http-server"
+        extract: |
+          Extract: target URL, SSL verification setting, protocol version,
+          any SSL-specific config. Max 5 lines.
+
+      - id: availability
+        tool: get_network_app_synthetics_metrics
+        params:
+          metric_id: "WEB_AVAILABILITY"
+          start_date: "{{window_start}}"
+          end_date: "{{window_end}}"
+          aggregation_type: "MEAN"
+          filter_dimension: "TEST"
+          filter_values: ["{{test_id}}"]
+        extract: |
+          When did SSL failures start? All agents or some? Max 4 lines.
+
+      - id: root_cause
+        tool: none
+        prompt: |
+          FIRST, write a one-line working diagnosis:
+          DIAGNOSIS: [symptom] + [blast radius] + [likely fault domain] + [confidence]
+
+          THEN determine SSL/TLS root cause. Consider:
+          - Certificate expired or not yet valid
+          - Certificate CN/SAN mismatch with target hostname
+          - Incomplete certificate chain (missing intermediate)
+          - Self-signed certificate with verification enabled
+          - TLS version mismatch (server requires newer/older)
+          - Certificate revoked
+          - If ALL agents affected simultaneously → cert-side issue
+          - If SOME agents → possible CDN/load balancer serving different certs
+          Use standard RCA format.
+
+  # ──────────────────────────────────────────────
+  # CONNECTIVITY: target unreachable / packet loss
+  # ──────────────────────────────────────────────
+  connectivity:
+    description: "Investigate connectivity loss or significant packet loss"
+    inputs: [test_id]
+    steps:
+      - id: test_config
+        tool: get_network_app_synthetics_test
+        params:
+          testId: "{{test_id}}"
+        extract: |
+          Extract: test_name, target, type, protocol, agents (name + location). Max 6 lines.
+
+      - id: events
+        tool: list_events
+        params:
+          window: "6h"
+        extract: |
+          Events related to this test or target. List: event_id, type, severity,
+          start_time, affected_agents. Max 8 lines.
+
+      - id: loss_metrics
+        tool: get_network_app_synthetics_metrics
+        params:
+          metric_id: "NET_LOSS"
+          start_date: "{{window_start}}"
+          end_date: "{{window_end}}"
+          aggregation_type: "MEAN"
+          filter_dimension: "TEST"
+          filter_values: ["{{test_id}}"]
+        extract: |
+          Loss over time: when did it start, current level, which agents see
+          100% loss vs partial vs none. Max 5 lines.
+
+      - id: latency_metrics
+        tool: get_network_app_synthetics_metrics
+        params:
+          metric_id: "NET_LATENCY"
+          start_date: "{{window_start}}"
+          end_date: "{{window_end}}"
+          aggregation_type: "MEAN"
+          filter_dimension: "TEST"
+          filter_values: ["{{test_id}}"]
+        extract: |
+          Latency trend: baseline vs current. Spikes correlating with loss? Max 4 lines.
+
+      - id: full_path
+        tool: get_full_path_visualization
+        params:
+          testId: "{{test_id}}"
+          window: "1h"
+        extract: |
+          For EACH agent: trace the path hop by hop.
+          Identify: last responding hop, first non-responding hop,
+          which AS/network/provider each belongs to.
+          Find the COMMON point where paths break across agents. Max 12 lines.
+
+      - id: bgp_check
+        tool: get_bgp_test_results
+        condition: "The path visualization shows the break point is at a network/AS boundary, OR paths break at different points for different agents"
+        params:
+          testId: "{{test_id}}"
+          window: "6h"
+        extract: |
+          BGP reachability: is the prefix reachable from all monitors?
+          Any reachability drops? When? Correlate with loss timeline. Max 6 lines.
+
+      - id: outages
+        tool: search_outages
+        params:
+          window: "6h"
+        extract: |
+          Any outages matching the provider/AS where paths break?
+          Any outages affecting the target? Max 4 lines.
+
+      - id: root_cause
+        tool: none
+        prompt: |
+          FIRST, write a one-line working diagnosis:
+          DIAGNOSIS: [symptom] + [blast radius] + [likely fault domain] + [confidence]
+
+          THEN determine connectivity failure root cause.
+
+          DECISION LOGIC:
+          - Path breaks at same hop for all agents → that hop/provider is down
+          - Path breaks at different hops per agent → target-side issue
+          - BGP reachability dropped → routing issue (check bgp playbook)
+          - Loss is partial (not 100%) → congestion, not outage
+          - Outage matches the break point → confirmed provider outage
+          - No path issues but 100% loss → firewall/ACL change at target
+
+          Use standard RCA format.
+
+  # ──────────────────────────────────────────────
+  # LATENCY: performance degradation
+  # ──────────────────────────────────────────────
+  latency:
+    description: "Investigate latency or response time degradation"
+    inputs: [test_id]
+    steps:
+      - id: test_config
+        tool: get_network_app_synthetics_test
+        params:
+          testId: "{{test_id}}"
+        extract: |
+          Extract: test_name, target, type, agents. Max 6 lines.
+
+      - id: net_latency
+        tool: get_network_app_synthetics_metrics
+        params:
+          metric_id: "NET_LATENCY"
+          start_date: "{{window_start}}"
+          end_date: "{{window_end}}"
+          aggregation_type: "MEAN"
+          filter_dimension: "TEST"
+          filter_values: ["{{test_id}}"]
+        extract: |
+          Latency trend: baseline (first hours) vs current, when degradation started,
+          magnitude of increase. Per-agent if available. Max 5 lines.
+
+      - id: response_time
+        tool: get_network_app_synthetics_metrics
+        params:
+          metric_id: "WEB_TTFB"
+          start_date: "{{window_start}}"
+          end_date: "{{window_end}}"
+          aggregation_type: "MEAN"
+          filter_dimension: "TEST"
+          filter_values: ["{{test_id}}"]
+        extract: |
+          TTFB trend: baseline vs current. Does TTFB increase match network latency
+          increase, or is TTFB much higher (indicating server processing delay)? Max 4 lines.
+
+      - id: loss_check
+        tool: get_network_app_synthetics_metrics
+        params:
+          metric_id: "NET_LOSS"
+          start_date: "{{window_start}}"
+          end_date: "{{window_end}}"
+          aggregation_type: "MEAN"
+          filter_dimension: "TEST"
+          filter_values: ["{{test_id}}"]
+        extract: |
+          Any packet loss? Loss causes TCP retransmissions which inflate latency. Max 3 lines.
+
+      - id: path_analysis
+        tool: get_path_visualization
+        condition: "Network latency is elevated (not just TTFB/application slowness)"
+        params:
+          testId: "{{test_id}}"
+          window: "1h"
+        extract: |
+          Identify the hop(s) contributing most latency.
+          Which AS/provider? Is it a peering point, backbone, or last-mile? Max 8 lines.
+
+      - id: anomalies
+        tool: get_anomalies
+        params:
+          testId: "{{test_id}}"
+          window: "24h"
+        extract: |
+          Any latency or response time anomalies? When, magnitude. Max 4 lines.
+
+      - id: root_cause
+        tool: none
+        prompt: |
+          FIRST, write a one-line working diagnosis:
+          DIAGNOSIS: [symptom] + [blast radius] + [likely fault domain] + [confidence]
+
+          THEN determine latency root cause.
+
+          DECISION LOGIC:
+          - Network latency high + TTFB proportionally high → network-layer issue
+            → identify the slow hop/provider from path analysis
+          - Network latency normal + TTFB high → application/server-side slowness
+          - Latency high from ALL agents → target-side or last-mile congestion
+          - Latency high from SOME agents → mid-path issue (specific ISP/peering)
+          - Packet loss present → retransmissions inflating latency
+          - Latency increased at specific time → correlate with BGP changes or maintenance
+
+          Use standard RCA format.
+
+  # ──────────────────────────────────────────────
+  # BGP: routing anomalies
+  # ──────────────────────────────────────────────
+  bgp:
+    description: "Investigate BGP routing anomalies — route leaks, hijacks, withdrawals"
+    inputs: [test_id]
+    steps:
+      - id: bgp_results
+        tool: get_bgp_test_results
+        params:
+          testId: "{{test_id}}"
+          window: "6h"
+        extract: |
+          Prefix, reachability % over time, number of monitors,
+          any reachability changes and when. Max 6 lines.
+
+      - id: bgp_routes
+        tool: get_bgp_route_details
+        params:
+          testId: "{{test_id}}"
+          window: "6h"
+        extract: |
+          AS paths seen from different monitors. Any changes?
+          New ASes appearing? Path lengthening? Multiple origin ASes?
+          Signs of hijack (unexpected origin AS) or leak (unexpected transit AS)? Max 8 lines.
+
+      - id: path_impact
+        tool: get_path_visualization
+        params:
+          testId: "{{test_id}}"
+          window: "1h"
+        extract: |
+          Data-plane paths: do they match BGP control-plane?
+          Any traffic going through unexpected ASes? Max 6 lines.
+
+      - id: outages
+        tool: search_outages
+        params:
+          window: "6h"
+        extract: |
+          Any provider outages correlating with BGP changes? Max 4 lines.
+
+      - id: root_cause
+        tool: none
+        prompt: |
+          FIRST, write a one-line working diagnosis:
+          DIAGNOSIS: [symptom] + [blast radius] + [likely fault domain] + [confidence]
+
+          THEN determine BGP root cause.
+
+          DECISION LOGIC:
+          - Reachability dropped + prefix withdrawn → origin AS stopped announcing
+          - New origin AS appeared → possible hijack (verify if legitimate)
+          - AS path lengthened + latency increased → route leak or suboptimal routing
+          - Multiple paths changed simultaneously → upstream provider issue
+          - Reachability flapping → BGP session instability
+          - Outage matches AS in path → provider-caused routing issue
+
+          Use standard RCA format.
+
+  # ──────────────────────────────────────────────
+  # ENDPOINT: end-user experience issues
+  # ──────────────────────────────────────────────
+  endpoint:
+    description: "Investigate endpoint agent issues — WiFi, local network, user experience"
+    inputs: [agent_filter]
+    steps:
+      - id: list_agents
+        tool: list_endpoint_agents
+        params:
+          filter: "{{agent_filter}}"
+        extract: |
+          List agents: agent_id, name, location, OS, network, connection status. Max 10 lines.
+
+      - id: endpoint_metrics
+        tool: get_endpoint_agent_metrics
+        params:
+          window: "2h"
+        extract: |
+          Per-agent summary: network quality (loss%, latency), wireless signal strength,
+          web response times, connection type (wired/wireless/cellular).
+          Flag degraded agents. Max 10 lines.
+
+      - id: events
+        tool: list_events
+        params:
+          window: "6h"
+        extract: |
+          Endpoint-related events. Max 5 lines.
+
+      - id: root_cause
+        tool: none
+        prompt: |
+          FIRST, write a one-line working diagnosis:
+          DIAGNOSIS: [symptom] + [blast radius] + [likely fault domain] + [confidence]
+
+          THEN determine endpoint issue root cause.
+
+          DECISION LOGIC:
+          - Single endpoint degraded + wireless signal weak → WiFi issue
+          - Single endpoint degraded + wired + high loss → local network issue
+          - Multiple endpoints at same location degraded → office network/gateway issue
+          - Multiple endpoints across locations degraded → target/service issue
+          - Endpoint metrics fine but web response slow → application-side issue
+          - High cellular latency → mobile network congestion
+
+          Use standard RCA format.
+
+  # ──────────────────────────────────────────────
+  # MULTI_TEST: correlate failures across tests
+  # ──────────────────────────────────────────────
+  multi_test:
+    description: "Correlate failures across multiple tests to find common root cause"
+    inputs: [test_ids]
+    steps:
+      - id: test_details
+        tool: list_tests
+        params: {}
+        extract: |
+          For each test in {{test_ids}}: test_name, target, type, agents.
+          Find commonalities: same target IP? same agents? same target domain? Max 10 lines.
+
+      - id: alerts_all
+        tool: list_alerts
+        params:
+          state: "TRIGGER"
+        extract: |
+          All active alerts. Group by: same start_time? same agents affected?
+          same error type? Max 10 lines.
+
+      - id: outages
+        tool: search_outages
+        params:
+          window: "6h"
+        extract: |
+          Any outages affecting multiple tests? Which provider? Max 5 lines.
+
+      - id: root_cause
+        tool: none
+        prompt: |
+          FIRST, write a one-line working diagnosis:
+          DIAGNOSIS: [symptom] + [blast radius] + [likely fault domain] + [confidence]
+
+          THEN determine the COMMON root cause across multiple failing tests.
+
+          DECISION LOGIC:
+          - Same target/IP across tests → target is down
+          - Same agents failing across tests → agent location/network issue
+          - Same provider in path across tests → provider outage
+          - Same time of failure across tests → correlated event (maintenance, attack, outage)
+          - Different targets but same DNS server → DNS infrastructure issue
+          - Different targets but same CDN → CDN issue
+
+          Identify which alerts are ROOT CAUSE vs SYMPTOMS.
+          Use standard RCA format.
